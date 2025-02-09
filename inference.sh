@@ -7,4 +7,5 @@ python -m scripts.inference \
     --guidance_scale 1.5 \
     --video_path "assets/demo1_video.mp4" \
     --audio_path "assets/demo1_audio.wav" \
-    --video_out_path "video_out.mp4"
+    --video_out_path "video_out.mp4" \
+    --superres none  # or GFPGAN / CodeFormer

@@ -28,7 +28,7 @@ run:
   recon_loss_weight: 1 # 1
   guidance_scale: 1.0 # 1.5 or 1.0
   trepa_loss_weight: 10
-  inference_steps: 20
+  inference_steps: 5
   seed: 1247
   use_mixed_noise: true
   mixed_noise_alpha: 1 # 1

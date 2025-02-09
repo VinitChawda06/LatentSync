@@ -1,16 +1,6 @@
 # Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import argparse
 from omegaconf import OmegaConf
@@ -31,6 +21,7 @@ def main(config, args):
     print(f"Input video path: {args.video_path}")
     print(f"Input audio path: {args.audio_path}")
     print(f"Loaded checkpoint path: {args.inference_ckpt_path}")
+    print(f"Super-resolution option: {args.superres}")
 
     scheduler = DDIMScheduler.from_pretrained("configs")
 
@@ -52,19 +43,18 @@ def main(config, args):
         args.inference_ckpt_path,  # load checkpoint
         device="cpu",
     )
-
     unet = unet.to(dtype=dtype)
 
     # set xformers
-    if is_xformers_available():
-        unet.enable_xformers_memory_efficient_attention()
+    # if is_xformers_available():
+    #     unet.enable_xformers_memory_efficient_attention()
 
     pipeline = LipsyncPipeline(
         vae=vae,
         audio_encoder=audio_encoder,
         unet=unet,
         scheduler=scheduler,
-    ).to("cuda")
+    ).to("cpu")
 
     if args.seed != -1:
         set_seed(args.seed)
@@ -73,6 +63,7 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
+    # Pass superres to pipeline
     pipeline(
         video_path=args.video_path,
         audio_path=args.audio_path,
@@ -84,6 +75,7 @@ def main(config, args):
         weight_dtype=dtype,
         width=config.data.resolution,
         height=config.data.resolution,
+        superres=args.superres,  # <--- pass this
     )
 
 
@@ -97,8 +89,17 @@ if __name__ == "__main__":
     parser.add_argument("--inference_steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1247)
-    args = parser.parse_args()
 
+    # NEW: superres argument
+    parser.add_argument(
+        "--superres",
+        type=str,
+        default="none",
+        choices=["none", "GFPGAN", "CodeFormer"],
+        help="Apply super-resolution to generated sub-frame if needed.",
+    )
+
+    args = parser.parse_args()
     config = OmegaConf.load(args.unet_config_path)
 
     main(config, args)

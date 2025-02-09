@@ -61,7 +61,11 @@ class LipsyncPipeline(DiffusionPipeline):
         if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
             deprecation_message = (
                 f"The configuration file of this scheduler: {scheduler} is outdated. `steps_offset`"
-                f" should be set to 1. Please update the config."
+                f" should be set to 1 instead of {scheduler.config.steps_offset}. Please make sure "
+                "to update the config accordingly as leaving `steps_offset` might led to incorrect results"
+                " in future versions. If you have downloaded this checkpoint from the Hugging Face Hub,"
+                " it would be very nice if you could open a Pull request for the `scheduler/scheduler_config.json`"
+                " file"
             )
             deprecate("steps_offset!=1", "1.0.0", deprecation_message, standard_warn=False)
             new_config = dict(scheduler.config)
@@ -70,8 +74,11 @@ class LipsyncPipeline(DiffusionPipeline):
 
         if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is True:
             deprecation_message = (
-                f"The configuration file of this scheduler: {scheduler} has `clip_sample`=True."
-                " Should be set to False. Please update the config."
+                f"The configuration file of this scheduler: {scheduler} has not set the configuration `clip_sample`."
+                " `clip_sample` should be set to False in the configuration file. Please make sure to update the"
+                " config accordingly as not setting `clip_sample` in the config might lead to incorrect results in"
+                " future versions. If you have downloaded this checkpoint from the Hugging Face Hub, it would be very"
+                " nice if you could open a Pull request for the `scheduler/scheduler_config.json` file"
             )
             deprecate("clip_sample not set", "1.0.0", deprecation_message, standard_warn=False)
             new_config = dict(scheduler.config)
@@ -84,8 +91,15 @@ class LipsyncPipeline(DiffusionPipeline):
         is_unet_sample_size_less_64 = hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
         if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
             deprecation_message = (
-                "The configuration file of the unet has `sample_size` < 64 which is unlikely. "
-                "If your checkpoint is fine-tuned from stable-diffusion, set sample_size=64."
+                "The configuration file of the unet has set the default `sample_size` to smaller than"
+                " 64 which seems highly unlikely. If your checkpoint is a fine-tuned version of any of the"
+                " following: \n- CompVis/stable-diffusion-v1-4 \n- CompVis/stable-diffusion-v1-3 \n-"
+                " CompVis/stable-diffusion-v1-2 \n- CompVis/stable-diffusion-v1-1 \n- runwayml/stable-diffusion-v1-5"
+                " \n- runwayml/stable-diffusion-inpainting \n you should change 'sample_size' to 64 in the"
+                " configuration file. Please make sure to update the config accordingly as leaving `sample_size=32`"
+                " in the config might lead to incorrect results in future versions. If you have downloaded this"
+                " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
+                " the `unet/config.json` file"
             )
             deprecate("sample_size<64", "1.0.0", deprecation_message, standard_warn=False)
             new_config = dict(unet.config)
@@ -100,6 +114,7 @@ class LipsyncPipeline(DiffusionPipeline):
         )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+
         self.set_progress_bar_config(desc="Steps")
 
     def enable_vae_slicing(self):
@@ -116,7 +131,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
         device = torch.device(f"cuda:{gpu_id}")
 
-        for cpu_offloaded_model in [self.unet, self.vae, self.audio_encoder]:
+        for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae]:
             if cpu_offloaded_model is not None:
                 cpu_offload(cpu_offloaded_model, device)
 
@@ -140,11 +155,17 @@ class LipsyncPipeline(DiffusionPipeline):
         return decoded_latents
 
     def prepare_extra_step_kwargs(self, generator, eta):
+        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
+        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
+        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
+        # and should be between [0, 1]
+
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
+        # check if the scheduler accepts generator
         accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
         if accepts_generator:
             extra_step_kwargs["generator"] = generator
@@ -152,11 +173,17 @@ class LipsyncPipeline(DiffusionPipeline):
 
     def check_inputs(self, height, width, callback_steps):
         assert height == width, "Height and width must be equal"
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(f"`height` and `width` must be divisible by 8 but are {height} x {width}.")
 
-        if (callback_steps is None) or (not isinstance(callback_steps, int) or callback_steps <= 0):
-            raise ValueError(f"`callback_steps` must be a positive integer but is {callback_steps}.")
+        if height % 8 != 0 or width % 8 != 0:
+            raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
+
+        if (callback_steps is None) or (
+            callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+        ):
+            raise ValueError(
+                f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
+                f" {type(callback_steps)}."
+            )
 
     def prepare_latents(self, batch_size, num_frames, num_channels_latents, height, width, dtype, device, generator):
         shape = (
@@ -169,26 +196,38 @@ class LipsyncPipeline(DiffusionPipeline):
         rand_device = "cpu" if device.type == "mps" else device
         latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype).to(device)
         latents = latents.repeat(1, 1, num_frames, 1, 1)
+
+        # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
-    def prepare_mask_latents(self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance):
+    def prepare_mask_latents(
+        self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # resize the mask to latents shape as we concatenate the mask to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
         mask = torch.nn.functional.interpolate(
             mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
         )
         masked_image = masked_image.to(device=device, dtype=dtype)
+
+        # encode the mask image into latents space so we can concatenate it to the latents
         masked_image_latents = self.vae.encode(masked_image).latent_dist.sample(generator=generator)
         masked_image_latents = (masked_image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
+        # aligning device to prevent device errors when concating it with the latent model input
         masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
         mask = mask.to(device=device, dtype=dtype)
 
+        # assume batch size = 1
         mask = rearrange(mask, "f c h w -> 1 c f h w")
         masked_image_latents = rearrange(masked_image_latents, "f c h w -> 1 c f h w")
 
-        if do_classifier_free_guidance:
-            mask = torch.cat([mask] * 2)
-            masked_image_latents = torch.cat([masked_image_latents] * 2)
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+        masked_image_latents = (
+            torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+        )
         return mask, masked_image_latents
 
     def prepare_image_latents(self, images, device, dtype, generator, do_classifier_free_guidance):
@@ -196,8 +235,8 @@ class LipsyncPipeline(DiffusionPipeline):
         image_latents = self.vae.encode(images).latent_dist.sample(generator=generator)
         image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         image_latents = rearrange(image_latents, "f c h w -> 1 c f h w")
-        if do_classifier_free_guidance:
-            image_latents = torch.cat([image_latents] * 2)
+        image_latents = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
+
         return image_latents
 
     def set_progress_bar_config(self, **kwargs):
@@ -207,6 +246,7 @@ class LipsyncPipeline(DiffusionPipeline):
 
     @staticmethod
     def paste_surrounding_pixels_back(decoded_latents, pixel_values, masks, device, weight_dtype):
+        # Paste the surrounding pixels back, because we only want to change the mouth region
         pixel_values = pixel_values.to(device=device, dtype=weight_dtype)
         masks = masks.to(device=device, dtype=weight_dtype)
         combined_pixel_values = decoded_latents * masks + pixel_values * (1 - masks)
@@ -231,14 +271,11 @@ class LipsyncPipeline(DiffusionPipeline):
             faces.append(face)
             boxes.append(box)
             affine_matrices.append(affine_matrix)
+
         faces = torch.stack(faces)
         return faces, video_frames, boxes, affine_matrices
 
     def restore_video(self, faces, video_frames, boxes, affine_matrices):
-        """
-        Replaces the lipsynced faces into the original frames.
-        Potential place to do super-resolution on the face patch if needed.
-        """
         video_frames = video_frames[: faces.shape[0]]
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
@@ -246,97 +283,14 @@ class LipsyncPipeline(DiffusionPipeline):
             x1, y1, x2, y2 = boxes[index]
             height = int(y2 - y1)
             width = int(x2 - x1)
-
-            # face shape = (C, H, W)
-            _, face_h, face_w = face.shape
-
-            # === SUPERRES ADD START ===
-            # If user selected GFPGAN/CodeFormer AND the face is smaller than the region
-            # we are about to fill, run superresolution. 
-            if self.superres != "none" and (face_h < height or face_w < width):
-                scale_h = height / face_h
-                scale_w = width / face_w
-                scale_factor = max(scale_h, scale_w)
-                # Convert face (torch tensor) to a NumPy or PIL image, apply SR, convert back:
-                if self.superres == "GFPGAN":
-                    face = self.apply_gfpgan_superres(face, scale_factor)
-                elif self.superres == "CodeFormer":
-                    face = self.apply_codeformer_superres(face, scale_factor)
-                # else, default do nothing special
-            # === SUPERRES ADD END ===
-
-            # Now do normal resize to match bounding box
             face = torchvision.transforms.functional.resize(face, size=(height, width), antialias=True)
             face = rearrange(face, "c h w -> h w c")
             face = (face / 2 + 0.5).clamp(0, 1)
             face = (face * 255).to(torch.uint8).cpu().numpy()
-
-            # If your pipeline already does face restoration or alignment:
-            out_frame = self.image_processor.restorer.restore_img(
-                video_frames[index], face, affine_matrices[index]
-            )
+            # face = cv2.resize(face, (width, height), interpolation=cv2.INTER_LANCZOS4)
+            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
-
-    # === SUPERRES ADD START ===
-    def apply_gfpgan_superres(self, face_tensor, scale_factor):
-        """
-        Example placeholder for GFPGAN super-resolution logic.
-        - face_tensor is (C, H, W) in [0,1] or [-1,1], depending on pipeline
-        - scale_factor is a float ratio
-
-        You must convert to a format GFPGAN expects (e.g. BGR NumPy image),
-        run GFPGAN's restorer, then convert back to the shape (C, H, W).
-        """
-        # Convert Torch -> NumPy for demonstration
-        face_np = face_tensor.detach().cpu().float().numpy()  # shape (C,H,W)
-        face_np = np.transpose(face_np, (1, 2, 0))  # (H,W,C)
-
-        # For example, scale up with cv2 first
-        new_h = int(face_np.shape[0] * scale_factor)
-        new_w = int(face_np.shape[1] * scale_factor)
-        face_np_bgr = cv2.cvtColor(face_np, cv2.COLOR_RGB2BGR)
-        upscaled = cv2.resize(face_np_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-        # Here you would run GFPGAN's restorer. For example:
-        #   _, restored_bgr, _ = self.gfpgan_restorer.enhance(upscaled, has_aligned=True, only_center_face=False)
-        # Suppose we skip and just pretend 'restored_bgr = upscaled' 
-        restored_bgr = upscaled
-
-        # Convert back
-        restored_rgb = cv2.cvtColor(restored_bgr, cv2.COLOR_BGR2RGB)
-        restored_rgb = np.transpose(restored_rgb, (2, 0, 1))  # (C,H,W)
-        # Convert to Torch
-        restored_torch = torch.from_numpy(restored_rgb).to(face_tensor.device, dtype=face_tensor.dtype)
-
-        # If your pipeline expects -1..1, rescale:
-        #   restored_torch = (restored_torch / 255.0) * 2 - 1
-        # Or if your pipeline uses 0..1, do that. Example:
-        restored_torch = restored_torch / 255.0  # 0..1
-        return restored_torch
-
-    def apply_codeformer_superres(self, face_tensor, scale_factor):
-        """
-        Example placeholder for CodeFormer super-resolution logic.
-        Same steps: convert face_tensor -> NumPy -> run CodeFormer -> back to torch.
-        """
-        face_np = face_tensor.detach().cpu().float().numpy()
-        face_np = np.transpose(face_np, (1, 2, 0))  # (H,W,C)
-        new_h = int(face_np.shape[0] * scale_factor)
-        new_w = int(face_np.shape[1] * scale_factor)
-        face_np_bgr = cv2.cvtColor(face_np, cv2.COLOR_RGB2BGR)
-        upscaled = cv2.resize(face_np_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-        # Here you would do something like: result_bgr = codeformer_enhancer(upscaled)
-        # For now, assume we skip and do no real enhancement:
-        result_bgr = upscaled
-
-        restored_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-        restored_rgb = np.transpose(restored_rgb, (2, 0, 1))
-        restored_torch = torch.from_numpy(restored_rgb).to(face_tensor.device, dtype=face_tensor.dtype)
-        restored_torch = restored_torch / 255.0  # 0..1 range
-        return restored_torch
-    # === SUPERRES ADD END ===
 
     @torch.no_grad()
     def __call__(
@@ -358,20 +312,14 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
-        superres: str = "none",  # <--- ADDED
         **kwargs,
     ):
-        """
-        superres: "none", "GFPGAN", or "CodeFormer"
-        """
-        # Store the superres option for usage in restore_video()
-        self.superres = superres
-
         is_train = self.unet.training
         self.unet.eval()
 
         check_ffmpeg_installed()
 
+        # 0. Define call parameters
         batch_size = 1
         device = self._execution_device
         self.image_processor = ImageProcessor(height, mask=mask, device="cuda")
@@ -380,28 +328,41 @@ class LipsyncPipeline(DiffusionPipeline):
         faces, original_video_frames, boxes, affine_matrices = self.affine_transform_video(video_path)
         audio_samples = read_audio(audio_path)
 
-        # 1. Default height and width
+        # 1. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
         # 2. Check inputs
         self.check_inputs(height, width, callback_steps)
 
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+
+        # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
         self.video_fps = video_fps
 
         if self.unet.add_audio_layer:
             whisper_feature = self.audio_encoder.audio2feat(audio_path)
             whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+
             num_inferences = min(len(faces), len(whisper_chunks)) // num_frames
         else:
             num_inferences = len(faces) // num_frames
 
         synced_video_frames = []
+        masked_video_frames = []
+
         num_channels_latents = self.vae.config.latent_channels
+
+        # Prepare latent variables
         all_latents = self.prepare_latents(
             batch_size,
             num_frames * num_inferences,
@@ -422,14 +383,13 @@ class LipsyncPipeline(DiffusionPipeline):
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-
             inference_faces = faces[i * num_frames : (i + 1) * num_frames]
             latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
-
             pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
 
+            # 7. Prepare mask latent variables
             mask_latents, masked_image_latents = self.prepare_mask_latents(
                 masks,
                 masked_pixel_values,
@@ -441,6 +401,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 do_classifier_free_guidance,
             )
 
+            # 8. Prepare image latents
             image_latents = self.prepare_image_latents(
                 pixel_values,
                 device,
@@ -449,37 +410,50 @@ class LipsyncPipeline(DiffusionPipeline):
                 do_classifier_free_guidance,
             )
 
+            # 9. Denoising loop
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for j, t in enumerate(timesteps):
+                    # expand the latents if we are doing classifier free guidance
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+
+                    # concat latents, mask, masked_image_latents in the channel dimension
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                     latent_model_input = torch.cat(
                         [latent_model_input, mask_latents, masked_image_latents, image_latents], dim=1
                     )
+
+                    # predict the noise residual
                     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=audio_embeds).sample
 
+                    # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
 
+                    # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
+                    # call the callback, if provided
                     if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
                         progress_bar.update()
                         if callback is not None and j % callback_steps == 0:
                             callback(j, t, latents)
 
+            # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, pixel_values, 1 - masks, device, weight_dtype
             )
             synced_video_frames.append(decoded_latents)
+            # masked_video_frames.append(masked_pixel_values)
 
-        # Combine and restore the faces onto the original frames
         synced_video_frames = self.restore_video(
             torch.cat(synced_video_frames), original_video_frames, boxes, affine_matrices
         )
+        # masked_video_frames = self.restore_video(
+        #     torch.cat(masked_video_frames), original_video_frames, boxes, affine_matrices
+        # )
 
         audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
@@ -493,6 +467,8 @@ class LipsyncPipeline(DiffusionPipeline):
         os.makedirs(temp_dir, exist_ok=True)
 
         write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=25)
+        # write_video(video_mask_path, masked_video_frames, fps=25)
+
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
         command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
